@@ -2,7 +2,9 @@ import Janode from "janode";
 const { Logger } = Janode;
 import StreamingPlugin from "janode/plugins/streaming";
 import WRTC from "@roamhq/wrtc";
-const { RTCPeerConnection, nonstandard } = WRTC;
+const { MediaStream, RTCPeerConnection, nonstandard } = WRTC;
+const { i420ToRgba } = nonstandard;
+import sharp from "sharp";
 
 const connection = await Janode.connect({
   is_admin: false,
@@ -74,10 +76,26 @@ pc.ontrack = async event => {
   console.log("contraints:", track.getSettings());
 
   if (track.kind === "video") {
-    console.log("Got Video");
     videoSink = new nonstandard.RTCVideoSink(track);
-    videoSink.onframe = frame => console.log("Got frame", frame);
+    videoSink.onframe = async ({type, frame}) => {
+      console.log("Got Video", new Date().valueOf());
+
+      console.time("convert");
+      const { width, height, data } = frame
+      const rgbaData = new Uint8ClampedArray(width * height * 4);
+      const rgbaFrame = { width, height, data: rgbaData }
+      i420ToRgba(frame, rgbaFrame);
+      console.timeEnd("convert");
+
+      console.log(rgbaFrame);
+ 
+      const image = sharp(rgbaData, {raw: {width, height, channels: 4}});
+      await image.toFile("test.png");
+
+    };
   } else if (track.kind === "audio") {
+    return;
+
     console.log("Got Audio");
     audioSink = new nonstandard.RTCAudioSink(track);
     audioSink.ondata = data => console.log("Got data", data);
