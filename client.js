@@ -2,33 +2,32 @@ import Janode from "janode";
 const { Logger } = Janode;
 import StreamingPlugin from "janode/plugins/streaming";
 import WRTC from "@roamhq/wrtc";
-const { MediaStream, RTCPeerConnection, nonstandard } = WRTC;
-const { i420ToRgba } = nonstandard;
-import { OpusDecoder } from 'opus-decoder';
-import sharp from "sharp";
+const { RTCPeerConnection, nonstandard } = WRTC;
+const { i420ToRgba, RTCVideoSink, RTCAudioSink } = nonstandard;
 import fs from "fs";
-import WaveFile from "wavefile";
-import { FileWriter } from "wav";
+import { WaveFile } from "wavefile";
+import commandLineArgs from "command-line-args";
+import { Builder } from "./record";
 
-const decoder = new OpusDecoder({
-  sampleRate: 48000,
-  channels: 1,
-})
+const optionDefinitions = [
+  {name: "url", type: str, defaultValue: "ws://172.20.0.2:8188"},
+  {name: "image_dir", type: str, defaultValue: null},
+  {name: "input_file", type: str, defaultValue: null},
+  {name: "video_file", type: str, defaultValue: "video.mp4"},
+  {name: "audio_file", type: str, defaultValue: "audio.wav"},
+]
+const options = commandLineArgs(optionDefinitions);
 
 const connection = await Janode.connect({
   is_admin: false,
   address: {
-    url: "ws://172.20.0.2:8188",
+    url: options.url,
   }
 });
 
 const session = await connection.create();
 
-// console.log(session);
-
 const streamingHandle = await session.attach(StreamingPlugin);
-
-// console.log(streamingHandle);
 
 streamingHandle.on(Janode.EVENT.HANDLE_WEBRTCUP, evtdata => Logger.info('webrtcup event', evtdata));
 streamingHandle.on(Janode.EVENT.HANDLE_MEDIA, evtdata => Logger.info('media event', evtdata));
@@ -36,49 +35,46 @@ streamingHandle.on(Janode.EVENT.HANDLE_SLOWLINK, evtdata => Logger.info('slowlin
 streamingHandle.on(Janode.EVENT.HANDLE_HANGUP, evtdata => Logger.info('hangup event', evtdata));
 streamingHandle.on(Janode.EVENT.HANDLE_DETACHED, evtdata => Logger.info('detached event', evtdata));
 
-const offer = await streamingHandle.watch({
-  id: 1,
-  pin: null,
-});
+const offer = await streamingHandle.watch({id: 1, pin: null});
 
 let audioSink;
 let videoSink;
-//const wav_writer = new FileWriter("audio.wav", {sampleRate: 48000, bitDepth: 16, channels: 1});
+const isAudio = !!options.audio_file;
+let wavConfig = { numChannels: 0, sampleRate: 0, bitsPerSample: 0 };
+let wavList = [];
 
-const samples_list = [];
+const builder = new Builder(options.image_dir, options.input_file);
 
 process.on('SIGINT', async () => {
-  console.log("Caught interrupt signal");
-  let samples = Int16Array.from(samples_list.flatMap(arr => Array.from(arr)));
-  console.log(samples.length);
-  // wav_writer.end()
-  let wav = new WaveFile.WaveFile();
-  wav.fromScratch(1, 48000, "16", samples);
-  fs.writeFileSync("temp.wav", wav.toBuffer());
+  if (isAudio && wavList.length > 0) {
+    const wav = new WaveFile();
+    wav.fromScratch(wavConfig.numChannels, wavConfig.sampleRate, "" + wavConfig.bitsPerSample, wavList)
+    fs.writeFileSync(options.audio_file, wav.toBuffer());
+  }
+
+  if (!!options.video_file) {
+    builder.save(options.video_file);
+  }
+
   process.exit();
 });
 
 const pc = new RTCPeerConnection();
-console.log('init state:', pc.iceConnectionState);
-console.log(pc);
-pc.onnegotiationneeded = event => console.log('pc.onnegotiationneeded', event);
-pc.onicecandidate = async event => {
-  // console.log('pc.onicecandidate', event);
-  // console.log('state', pc.iceConnectionState);
 
+pc.onnegotiationneeded = event => {
+  console.log('pc.onnegotiationneeded', event);
+}
+pc.onicecandidate = async event => {
   if (!event.candidate) {
     console.log("Trickle complete");
-    //await streamingHandle.trickleComplete();
-
   } else {
     console.log("Try Trickle");
     await streamingHandle.trickle(event.candidate);
   }
 }
-
-
-
-pc.oniceconnectionstatechange = () => console.log('pc.oniceconnectionstatechange => ' + pc.iceConnectionState);
+pc.oniceconnectionstatechange = () => {
+  console.log('pc.oniceconnectionstatechange => ' + pc.iceConnectionState);
+}
 pc.ontrack = async event => {
   console.log('pc.ontrack', event);
 
@@ -94,54 +90,33 @@ pc.ontrack = async event => {
     console.log("track.onended", evt);
   };
 
-  const remoteStream = event.streams[0];
-  // console.log("remoteStream:", remoteStream);
   const track = event.track;
-  console.log("contraints:", track.getSettings());
 
   if (track.kind === "video") {
-    return;
-
-    videoSink = new nonstandard.RTCVideoSink(track);
-    videoSink.onframe = async ({type, frame}) => {
-      const { width, height, data } = frame
-
+    videoSink = new RTCVideoSink(track);
+    videoSink.onframe = async ({ frame }) => {
+      const { width, height } = frame
       const rgbaData = new Uint8ClampedArray(width * height * 4);
       const rgbaFrame = { width, height, data: rgbaData }
       i420ToRgba(frame, rgbaFrame);
-
-      const image = sharp(rgbaData, {raw: {width, height, channels: 4}});
-      await image.toFile(`images/${new Date().valueOf()}.png`);
+      
+      builder.append(rgbaData, new Date().valueOf());
     };
   } else if (track.kind === "audio") {
-    console.log("Got Audio");
-    audioSink = new nonstandard.RTCAudioSink(track);
-    audioSink.ondata = data => {
-      const {
-        samples,
-	bitsPerSample,
-	sampleRate,
-	channelCount,
-	numberOfFrames } = data;
+    audioSink = new RTCAudioSink(track);
+    audioSink.ondata = ({ samples, bitsPerSample, sampleRate, channelCount }) => {
+      if (!isAudio) return;
 
-      //const samples8 = new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength)
-      console.log("Got data", data);
-      //const res = decoder.decodeFrame(samples8);
-      //console.log(res);
-      samples_list.push(samples);
-      // wav_writer.write(Buffer.from(samples));
+      wavConfig.numChannels = channelCount;
+      wavConfig.sampleRate = sampleRate;
+      wavConfig.bitsPerSample = bitsPerSample;
+      wavList.push(samples);
     }
   }
 }
 
 await pc.setRemoteDescription(offer.jsep);
-console.log('set remote sdp OK');
 const answer = await pc.createAnswer();
-console.log('create answer OK');
 pc.setLocalDescription(answer);
-console.log('set local sdp OK');
-// console.log(answer)
 
 const evtdata = await streamingHandle.start({jsep: answer, e2ee: true});
-// console.log('streamingHandle.start:', evtdata);
-
