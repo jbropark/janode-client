@@ -4,7 +4,16 @@ import StreamingPlugin from "janode/plugins/streaming";
 import WRTC from "@roamhq/wrtc";
 const { MediaStream, RTCPeerConnection, nonstandard } = WRTC;
 const { i420ToRgba } = nonstandard;
+import { OpusDecoder } from 'opus-decoder';
 import sharp from "sharp";
+import fs from "fs";
+import WaveFile from "wavefile";
+import { FileWriter } from "wav";
+
+const decoder = new OpusDecoder({
+  sampleRate: 48000,
+  channels: 1,
+})
 
 const connection = await Janode.connect({
   is_admin: false,
@@ -32,10 +41,22 @@ const offer = await streamingHandle.watch({
   pin: null,
 });
 
-console.log(offer);
-
 let audioSink;
 let videoSink;
+//const wav_writer = new FileWriter("audio.wav", {sampleRate: 48000, bitDepth: 16, channels: 1});
+
+const samples_list = [];
+
+process.on('SIGINT', async () => {
+  console.log("Caught interrupt signal");
+  let samples = Int16Array.from(samples_list.flatMap(arr => Array.from(arr)));
+  console.log(samples.length);
+  // wav_writer.end()
+  let wav = new WaveFile.WaveFile();
+  wav.fromScratch(1, 48000, "16", samples);
+  fs.writeFileSync("temp.wav", wav.toBuffer());
+  process.exit();
+});
 
 const pc = new RTCPeerConnection();
 console.log('init state:', pc.iceConnectionState);
@@ -54,6 +75,9 @@ pc.onicecandidate = async event => {
     await streamingHandle.trickle(event.candidate);
   }
 }
+
+
+
 pc.oniceconnectionstatechange = () => console.log('pc.oniceconnectionstatechange => ' + pc.iceConnectionState);
 pc.ontrack = async event => {
   console.log('pc.ontrack', event);
@@ -76,29 +100,37 @@ pc.ontrack = async event => {
   console.log("contraints:", track.getSettings());
 
   if (track.kind === "video") {
+    return;
+
     videoSink = new nonstandard.RTCVideoSink(track);
     videoSink.onframe = async ({type, frame}) => {
-      console.log("Got Video", new Date().valueOf());
-
-      console.time("convert");
       const { width, height, data } = frame
+
       const rgbaData = new Uint8ClampedArray(width * height * 4);
       const rgbaFrame = { width, height, data: rgbaData }
       i420ToRgba(frame, rgbaFrame);
-      console.timeEnd("convert");
 
-      console.log(rgbaFrame);
- 
       const image = sharp(rgbaData, {raw: {width, height, channels: 4}});
-      await image.toFile("test.png");
-
+      await image.toFile(`images/${new Date().valueOf()}.png`);
     };
   } else if (track.kind === "audio") {
-    return;
-
     console.log("Got Audio");
     audioSink = new nonstandard.RTCAudioSink(track);
-    audioSink.ondata = data => console.log("Got data", data);
+    audioSink.ondata = data => {
+      const {
+        samples,
+	bitsPerSample,
+	sampleRate,
+	channelCount,
+	numberOfFrames } = data;
+
+      //const samples8 = new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength)
+      console.log("Got data", data);
+      //const res = decoder.decodeFrame(samples8);
+      //console.log(res);
+      samples_list.push(samples);
+      // wav_writer.write(Buffer.from(samples));
+    }
   }
 }
 
